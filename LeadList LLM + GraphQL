@@ -1,0 +1,532 @@
+
+---
+
+# Technical Design Document
+
+# Dynamic Schema Evolution with LLM + GraphQL + Metadata Registry
+
+---
+
+# 1. Executive Summary
+
+We need a system that allows:
+
+* Rapid schema evolution (including JSON/JSONB attributes)
+* Zero or minimal GraphQL schema churn
+* LLM-driven dynamic query generation
+* Strong governance around performance, cost, and security
+* Clear separation between database schema and API contract
+
+This document evaluates multiple architectural approaches and recommends a **metadata-driven registry architecture** that:
+
+* Keeps GraphQL stable
+* Enables dynamic field evolution
+* Supports LLM adaptability
+* Preserves performance predictability
+* Enforces security and cost governance
+
+---
+
+# 2. Problem Statement
+
+Our system must support:
+
+* Frequently evolving data models
+* JSON/JSONB-backed attributes
+* Dynamic filtering, sorting, and aggregation
+* LLM-based query construction
+
+The primary challenge:
+
+> How do we allow dynamic field evolution without repeatedly modifying GraphQL schemas, while maintaining performance, security, and operational control?
+
+There is an inherent tension between:
+
+* Flexibility (schema evolution)
+* Stability (API contracts)
+* Autonomy (LLM-driven querying)
+* Governance (cost, access, and observability)
+
+---
+
+# 3. Requirements
+
+## Functional Requirements
+
+* Query dynamic fields (including JSON attributes)
+* Filter, sort, aggregate
+* LLM-generated structured queries
+* No GraphQL updates for every new attribute
+
+## Non-Functional Requirements
+
+* Predictable performance
+* Query cost control
+* Field-level access control
+* Backward compatibility
+* Observability and monitoring
+* Token efficiency for LLM context
+
+---
+
+# 4. Architectural Approaches
+
+---
+
+## Approach 1: Static GraphQL Schema (Field-per-Attribute)
+
+### Definition
+
+Each DB field is explicitly defined in GraphQL.
+
+```graphql
+type Lead {
+  id: ID!
+  industry: String
+  priority: String
+  riskScore: Float
+}
+```
+
+### Pros
+
+* Strong typing
+* Clear API contract
+* Excellent tooling support
+* Compile-time validation
+
+### Cons
+
+* Requires GraphQL updates per field
+* Tight coupling to DB schema
+* Slows schema evolution
+* Not viable for dynamic JSON attributes
+
+### Verdict
+
+Stable but not flexible enough.
+
+---
+
+## Approach 2: Direct JSON Exposure via GraphQL
+
+### Definition
+
+Expose JSON directly:
+
+```graphql
+type Lead {
+  id: ID!
+  attributes: JSON
+}
+```
+
+Filtering:
+
+```graphql
+input JSONFilter {
+  path: String!
+  operator: FilterOperator!
+  value: String!
+}
+```
+
+### Pros
+
+* No GraphQL churn
+* Maximum flexibility
+
+### Cons
+
+* No type safety
+* Runtime errors instead of validation
+* Poor discoverability
+* Performance unpredictability
+* JSON path index complexity
+* High LLM hallucination risk
+* Hard access control
+
+### Verdict
+
+Too unsafe for production-scale systems.
+
+---
+
+## Approach 3: Full GraphQL Introspection for LLM
+
+### Definition
+
+Expose full GraphQL schema to LLM and allow dynamic query construction.
+
+### Pros
+
+* Zero manual prompt updates
+* Automatic schema awareness
+
+### Critical Risks
+
+* Token explosion
+* Performance unpredictability
+* Deep nested query generation
+* Exposure of internal fields
+* Tight LLM-schema coupling
+* Renaming fields breaks behavior
+* Hard to enforce cost limits
+* Reduced caching efficiency
+
+### Verdict
+
+High operational and governance risk.
+
+---
+
+## Approach 4: String-Based Dynamic Filter Input
+
+### Definition
+
+Stable GraphQL input:
+
+```graphql
+input FilterInput {
+  field: String!
+  operator: FilterOperator!
+  value: String!
+}
+```
+
+Backend validates field against registry.
+
+### Pros
+
+* No GraphQL churn
+* Backend governance
+* Supports dynamic fields
+* LLM-friendly
+* Strong validation possible
+
+### Cons
+
+* Runtime validation required
+* Requires registry governance
+
+### Verdict
+
+Strong foundation.
+
+---
+
+# 5. Recommended Architecture
+
+## Metadata-Driven Registry Model
+
+We recommend combining:
+
+* Stable GraphQL contract
+* Metadata registry layer
+* LLM capability discovery tools
+* Controlled SQL generation
+* Cost governance model
+
+---
+
+# 6. Logical Architecture Diagram
+
+```
++--------------------+
+|      User / AI     |
++--------------------+
+          |
+          v
++--------------------+
+|        LLM         |
+|  (Intent Parsing)  |
++--------------------+
+          |
+          | 1. Tool Call
+          v
++--------------------+
+| Metadata Registry  |
+|  (Field Catalog)   |
++--------------------+
+          |
+          | 2. Structured Query
+          v
++--------------------+
+|     GraphQL API    |
+| (Stable Contract)  |
++--------------------+
+          |
+          | 3. Validation + Cost Check
+          v
++--------------------+
+|   Query Builder    |
+|  (SQL Generator)   |
++--------------------+
+          |
+          v
++--------------------+
+|     Database       |
+| Indexed + JSONB    |
++--------------------+
+```
+
+---
+
+# 7. Data Flow Diagram
+
+User query:
+
+> “Show high priority healthcare leads created last month”
+
+---
+
+### Step 1 — LLM Capability Discovery
+
+LLM calls:
+
+```
+get_filterable_fields(entity="Lead")
+```
+
+Registry returns structured metadata.
+
+---
+
+### Step 2 — LLM Generates GraphQL
+
+```graphql
+query {
+  leads(
+    filters: [
+      { field: "industry", operator: EQ, value: "healthcare" }
+      { field: "priority", operator: EQ, value: "high" }
+      { field: "created_at", operator: BETWEEN, value: "2026-01-01,2026-01-31" }
+    ]
+  ) {
+    id
+    name
+  }
+}
+```
+
+---
+
+### Step 3 — Validation Pipeline
+
+1. Field exists?
+2. Operator allowed?
+3. Value type valid?
+4. Access allowed?
+5. Cost within limit?
+
+---
+
+### Step 4 — SQL Generation
+
+Generated SQL:
+
+```sql
+SELECT id, name
+FROM leads
+WHERE industry_generated = 'healthcare'
+  AND priority = 'high'
+  AND created_at BETWEEN '2026-01-01' AND '2026-01-31'
+LIMIT 100;
+```
+
+No raw JSON path exposure.
+
+---
+
+# 8. Metadata Registry — Detailed Schema Definition
+
+This is the control plane of the architecture.
+
+---
+
+## Table: entity_registry
+
+```sql
+CREATE TABLE entity_registry (
+  id UUID PRIMARY KEY,
+  name VARCHAR(100) NOT NULL,
+  db_table VARCHAR(100) NOT NULL,
+  description TEXT,
+  version INT NOT NULL DEFAULT 1,
+  is_active BOOLEAN DEFAULT TRUE
+);
+```
+
+---
+
+## Table: field_registry
+
+```sql
+CREATE TABLE field_registry (
+  id UUID PRIMARY KEY,
+  entity_id UUID REFERENCES entity_registry(id),
+
+  field_name VARCHAR(100) NOT NULL,
+  db_column VARCHAR(100) NOT NULL,
+  json_path VARCHAR(200),
+
+  data_type VARCHAR(50) NOT NULL,
+  is_filterable BOOLEAN DEFAULT TRUE,
+  is_sortable BOOLEAN DEFAULT FALSE,
+  is_aggregatable BOOLEAN DEFAULT FALSE,
+
+  allowed_operators TEXT[],
+  is_indexed BOOLEAN DEFAULT FALSE,
+
+  access_level VARCHAR(50) DEFAULT 'PUBLIC',
+  cost_weight INT DEFAULT 1,
+
+  created_at TIMESTAMP,
+  updated_at TIMESTAMP
+);
+```
+
+---
+
+## JSON Field Handling (Best Practice)
+
+Instead of querying raw JSON:
+
+```sql
+attributes ->> 'industry'
+```
+
+Use generated columns:
+
+```sql
+ALTER TABLE leads
+ADD COLUMN industry_generated TEXT
+GENERATED ALWAYS AS (attributes->>'industry') STORED;
+
+CREATE INDEX idx_leads_industry ON leads(industry_generated);
+```
+
+Registry maps:
+
+```
+industry → industry_generated
+```
+
+---
+
+# 9. Cost Governance Model
+
+Each field contributes to cost:
+
+```
+Total Query Cost =
+  Σ(field.cost_weight)
+  + join_cost
+  + aggregation_cost
+```
+
+Constraints:
+
+```
+MAX_COST = 10
+MAX_FILTERS = 5
+MAX_DEPTH = 2
+```
+
+Requests exceeding threshold are rejected.
+
+This prevents LLM-generated runaway queries.
+
+---
+
+# 10. LLM Tooling Interface
+
+Expose only controlled metadata:
+
+### get_filterable_fields(entity)
+
+Returns:
+
+```json
+{
+  "entity": "Lead",
+  "fields": [
+    {
+      "name": "industry",
+      "type": "STRING",
+      "operators": ["EQ", "IN"]
+    }
+  ]
+}
+```
+
+LLM does NOT see:
+
+* db_column
+* json_path
+* access_level
+* cost_weight
+
+Backend-only enforcement remains intact.
+
+---
+
+# 11. Benefits of Recommended Approach
+
+| Area             | Benefit                            |
+| ---------------- | ---------------------------------- |
+| Schema Evolution | Add fields without GraphQL changes |
+| LLM Flexibility  | Dynamic capability discovery       |
+| Performance      | Indexed virtual fields             |
+| Security         | Field-level allowlist              |
+| Predictability   | Cost-based validation              |
+| Observability    | Stable query shape                 |
+| Governance       | Clear separation of concerns       |
+
+---
+
+# 12. Why Not Direct GraphQL Schema Exposure?
+
+If full schema introspection is exposed:
+
+* LLM may generate deep joins
+* Internal fields become discoverable
+* Renaming fields changes behavior
+* Performance becomes unpredictable
+* Query cost governance weakens
+* Harder to cache and observe
+* API contract collapses into DB structure
+
+This approach may work in small prototypes.
+
+It does not scale safely.
+
+---
+
+# 13. Strategic Framing
+
+This design:
+
+* Preserves architectural boundaries
+* Enables rapid product evolution
+* Keeps AI adaptable
+* Maintains deterministic execution
+* Protects performance SLAs
+* Reduces long-term operational risk
+
+It shifts extensibility from:
+
+> GraphQL structure
+> to
+> Metadata governance
+
+That is the central architectural decision.
+
+---
+
+If you'd like, next we can:
+
+* Extend this to multi-entity joins
+* Add aggregation and group-by handling
+* Model behavior at 100M+ row scale
+* Or convert this into a slide-ready executive presentation version
