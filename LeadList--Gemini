@@ -1,0 +1,210 @@
+# Technical Design Document: High-Scale Lead Discovery Engine
+
+## 1. Executive Summary
+
+**Objective:** Provide a real-time, sortable search interface for 50M leads across 20+ normalized tables.
+**Core Challenge:** Sub-3s latency for "recently updated" sorts and dynamic filtering without using database triggers.
+**Proposed Solution:** An event-driven **Summary Table** acting as a Read Model, indexed with **GIN** for dynamic JSONB attributes, and exposed via an **MCP-powered LLM layer**.
+
+---
+
+## 2. System Architecture
+
+### 2.1 Component Context
+
+The system moves from a "Pull" architecture (expensive joins) to a "Push" architecture (event-driven projection).
+
+```mermaid
+graph TD
+    subgraph "Producer Services"
+        S1[Lead Service]
+        S2[Activity Service]
+        S20[Notes Service]
+    end
+
+    subgraph "Event Bus"
+        K[(Kafka Cluster)]
+    end
+
+    subgraph "Read Model Layer"
+        W[Projection Worker]
+        DB[(PostgreSQL 16+)]
+        ST[lead_search_summary]
+    end
+
+    S1 -- Emit Change --> K
+    S2 -- Emit Change --> K
+    S20 -- Emit Change --> K
+    K -- Consume --> W
+    W -- Atomic Upsert --> ST
+
+```
+
+---
+
+## 3. Data Ingestion & Projection
+
+### 3.1 Sequence Diagram: Event-Driven Projection
+
+This flow ensures that any change in the 20+ source tables is reflected in the search index with minimal lag.
+
+```mermaid
+sequenceDiagram
+    participant S as Source Service
+    participant K as Kafka Topic
+    participant W as Projection Worker
+    participant DB as Summary Table
+
+    Note over S, DB: Change occurs in one of 20+ source tables
+    S->>K: Publish Event {lead_id: 123, update: {...}}
+    K->>W: Fetch Event
+    W->>W: Map Update to JSONB Schema
+    W->>DB: UPSERT (id, last_activity_at, filter_attributes)
+    Note over DB: GREATEST(current_ts, event_ts)
+    DB-->>W: Acknowledge
+
+```
+
+### 3.2 SQL Schema & Indexing Strategy
+
+```sql
+CREATE TABLE lead_search_summary (
+    lead_id UUID PRIMARY KEY,
+    last_activity_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    status VARCHAR(50),
+    -- High-speed filtering blob
+    filter_attributes JSONB NOT NULL DEFAULT '{}',
+    -- Data for UI rendering (reduces back-joins)
+    display_metadata JSONB NOT NULL DEFAULT '{}'
+);
+
+-- Index for the primary 'Recent' sort
+CREATE INDEX idx_leads_activity_sort ON lead_search_summary (last_activity_at DESC);
+
+-- Index for dynamic filtering across the JSONB blob
+CREATE INDEX idx_leads_gin_filters ON lead_search_summary 
+USING GIN (filter_attributes jsonb_path_ops);
+
+```
+
+---
+
+## 4. Natural Language Search Layer (LLM + MCP)
+
+The user interacts with the data via natural language. The LLM acts as a semantic translator, using the **Model Context Protocol (MCP)** to communicate with the database tools safely.
+
+### 4.1 Sequence Diagram: Natural Language Query Flow
+
+```mermaid
+sequenceDiagram
+    participant U as User (UI)
+    participant L as LLM (Brain)
+    participant M as MCP Server (Tools)
+    participant G as GraphQL / DB
+    participant ST as Summary Table
+
+    U->>L: "Find tech leads in Austin over 90 score"
+    L->>M: List available tools?
+    M-->>L: search_leads(industry, city, min_score)
+    L->>M: Call search_leads(industry='Tech', city='Austin', min_score=90)
+    M->>G: Execute Query (JSONB Containment)
+    G->>ST: SELECT * FROM summary WHERE ...
+    ST-->>G: 1,200 Rows
+    G-->>M: Result Data
+    M-->>L: Raw Results (JSON)
+    L-->>U: "I found 1,200 tech leads in Austin..."
+
+```
+
+---
+
+## 5. Sample Implementation
+
+### 5.1 MCP Server (Python)
+
+This server exposes the technical search capabilities to any MCP-compliant LLM.
+
+```python
+from mcp.server.fastmcp import FastMCP
+import json
+
+# Initialize the MCP Server
+mcp = FastMCP("LeadsSearch")
+
+@mcp.tool()
+def search_leads(
+    industry: str = None, 
+    city: str = None, 
+    min_score: int = None
+) -> str:
+    """
+    Search leads in the 50M-row summary table using GIN indexes.
+    """
+    # Build JSONB containment filter
+    query_filters = {}
+    if industry: query_filters["industry"] = industry
+    if city: query_filters["city"] = city
+    if min_score: query_filters["score"] = {"_gt": min_score}
+
+    # Technical implementation note:
+    # This translates to: WHERE filter_attributes @> '{"industry": "Tech"}'
+    sql_preview = f"SELECT * FROM lead_search_summary WHERE filter_attributes @> '{json.dumps(query_filters)}'"
+    
+    return f"DB_QUERY: {sql_preview}\nSTATUS: Success\nMATCHES: 1450"
+
+```
+
+### 5.2 MCP Client / LLM Agent
+
+A simple script to demonstrate how the agent uses the tool.
+
+```python
+import anthropic
+
+# Configure the tool definition based on the MCP server output
+search_tool = {
+    "name": "search_leads",
+    "description": "Filters 50M leads by metadata fields.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "industry": {"type": "string"},
+            "city": {"type": "string"},
+            "min_score": {"type": "integer"}
+        }
+    }
+}
+
+def execute_nl_query(user_text):
+    client = anthropic.Anthropic(api_key="YOUR_KEY")
+    # The LLM chooses the tool based on the user's natural language
+    response = client.messages.create(
+        model="claude-3-5-sonnet-20241022",
+        tools=[search_tool],
+        messages=[{"role": "user", "content": user_text}]
+    )
+    return response
+
+```
+
+---
+
+## 6. Performance Benchmarks (Projected)
+
+| Operation | Scale | Latency | Index Used |
+| --- | --- | --- | --- |
+| **Global Sort** | 50M | 150ms | `idx_leads_activity_sort` |
+| **Industry Filter** | 50M | 400ms | `idx_leads_gin_filters` |
+| **Combined Query** | 50M | 800ms | Composite GIN |
+| **NL Translation** | N/A | 1.2s | LLM Inference |
+
+---
+
+## 7. Implementation Roadmap
+
+1. **Phase 1:** Set up `lead_search_summary` and GIN indexes.
+2. **Phase 2:** Implement Kafka Projection Workers (Atomic Upsert).
+3. **Phase 3:** Develop GraphQL Search endpoint wrapping the JSONB logic.
+4. **Phase 4:** Deploy MCP Server to allow LLM interaction.
+
+**Would you like me to elaborate on the Keyset Pagination logic to ensure "Page 10,000" is as fast as "Page 1"?**
