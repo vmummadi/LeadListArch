@@ -1,0 +1,613 @@
+# Technical Design Document
+
+# Denormalized Leads List Architecture (Projection-Based Read Model)
+
+## With JSONB, LLM, GraphQL, Scaling & Failure Analysis
+
+---
+
+# 1. Executive Summary (Expanded)
+
+We are designing a **read-optimized Leads List system** that must:
+
+* Serve sub-second list queries
+* Avoid runtime joins
+* Support dynamic filters (including custom JSON fields)
+* Integrate safely with LLM-driven query generation
+* Avoid frequent GraphQL schema churn
+* Scale to 100M+ leads
+* Maintain operational predictability
+
+The core decision:
+
+> Separate the write model (normalized relational) from the read model (denormalized projection).
+
+This is effectively a **CQRS-style architecture**:
+
+* Write side optimized for correctness.
+* Read side optimized for performance and dynamic filtering.
+
+This document details:
+
+* The projection schema
+* Indexing strategy
+* JSONB design
+* Scaling strategy at 100M+ rows
+* Failure modes and mitigations
+* LLM + GraphQL extension
+* Governance strategy
+
+---
+
+# 2. Architectural Overview (Deep Dive)
+
+## Why We Cannot Use Joins for List Queries
+
+At 100M+ rows:
+
+* Joins amplify I/O
+* Join selectivity becomes unpredictable
+* LLM-generated dynamic filters create unbounded join paths
+* Query planner misestimation causes latency spikes
+* Caching effectiveness drops
+
+Even well-indexed joins degrade under:
+
+* High cardinality fields
+* Compound filter combinations
+* Sorting on joined columns
+
+The leads list must therefore read from:
+
+```
+Single physical table
+```
+
+Every additional runtime join multiplies complexity.
+
+---
+
+## Architectural Principle
+
+**All list-level query fields must physically exist in the projection table.**
+
+No:
+
+* Lazy join fetch
+* JSON path extraction in WHERE clause
+* Cross-table lookup at read time
+
+---
+
+# 3. Projection Table Design (Expanded)
+
+## Table: `leads_list_projection`
+
+This table is explicitly optimized for:
+
+* Filtering
+* Sorting
+* Pagination
+* LLM-driven structured queries
+
+---
+
+### Schema
+
+```sql
+CREATE TABLE leads_list_projection (
+    -- Identity
+    id UUID PRIMARY KEY,
+
+    -- Core Lead Info
+    name TEXT NOT NULL,
+    email TEXT,
+    phone TEXT,
+
+    -- Denormalized relational data
+    account_id UUID,
+    account_name TEXT,
+    owner_id UUID,
+    owner_name TEXT,
+
+    -- Status & lifecycle
+    status TEXT,
+    priority TEXT,
+    stage TEXT,
+
+    -- Activity summary
+    last_activity_at TIMESTAMP,
+    next_activity_at TIMESTAMP,
+    activity_count INT DEFAULT 0,
+
+    -- Revenue signals
+    deal_value NUMERIC(14,2),
+    probability FLOAT,
+
+    -- System timestamps
+    created_at TIMESTAMP NOT NULL,
+    updated_at TIMESTAMP NOT NULL,
+    closed_at TIMESTAMP,
+
+    -- JSONB custom attributes
+    attributes JSONB,
+
+    -- Frequently queried generated columns
+    industry TEXT GENERATED ALWAYS AS (attributes->>'industry') STORED,
+    segment TEXT GENERATED ALWAYS AS (attributes->>'segment') STORED,
+    source TEXT GENERATED ALWAYS AS (attributes->>'source') STORED,
+
+    -- Soft delete
+    is_deleted BOOLEAN DEFAULT FALSE
+);
+```
+
+---
+
+## Why Generated Columns Matter
+
+Without generated columns:
+
+```sql
+WHERE attributes->>'industry' = 'healthcare'
+```
+
+Problems:
+
+* Function call in WHERE
+* Index may not be used
+* Slower scans
+
+With generated column:
+
+```sql
+WHERE industry = 'healthcare'
+```
+
+Index is simple B-tree.
+
+Predictable.
+
+---
+
+# 4. Indexing Strategy (Deep Breakdown)
+
+Indexing must balance:
+
+* Read speed
+* Write amplification
+* Storage footprint
+* Maintenance cost
+
+---
+
+## 4.1 Primary Index
+
+```sql
+PRIMARY KEY (id)
+```
+
+Required for:
+
+* Direct lookup
+* Update operations
+* CDC projection updates
+
+---
+
+## 4.2 High-Selectivity B-Tree Indexes
+
+Used for common filters:
+
+```sql
+CREATE INDEX idx_leads_status ON leads_list_projection(status);
+CREATE INDEX idx_leads_owner_id ON leads_list_projection(owner_id);
+CREATE INDEX idx_leads_created_at ON leads_list_projection(created_at DESC);
+```
+
+Why DESC on created_at?
+
+* Most list queries sort by recent first
+* Matches index order
+
+---
+
+## 4.3 Composite Indexes
+
+Only add when backed by observed query patterns.
+
+Example:
+
+```sql
+CREATE INDEX idx_owner_status_created
+ON leads_list_projection(owner_id, status, created_at DESC);
+```
+
+This supports:
+
+```
+WHERE owner_id = ?
+AND status = ?
+ORDER BY created_at DESC
+```
+
+Composite indexes should:
+
+* Match filter order
+* Include sort column last
+
+Overuse is dangerous.
+
+---
+
+## 4.4 Partial Indexes
+
+For large tables:
+
+```sql
+CREATE INDEX idx_active_leads
+ON leads_list_projection(status)
+WHERE is_deleted = FALSE;
+```
+
+Reduces index size dramatically.
+
+---
+
+## 4.5 GIN Index on JSONB
+
+Use cautiously:
+
+```sql
+CREATE INDEX idx_attributes_gin
+ON leads_list_projection
+USING GIN (attributes jsonb_path_ops);
+```
+
+Pros:
+
+* Supports dynamic JSON filtering
+
+Cons:
+
+* Large memory footprint
+* Slower writes
+* Harder to reason about performance
+
+Recommended only if dynamic fields cannot be pre-generated.
+
+---
+
+# 5. 100M+ Row Scaling Strategy (Expanded)
+
+Scaling involves:
+
+* Storage
+* Query planning
+* Write throughput
+* Maintenance cost
+
+---
+
+## 5.1 Partitioning
+
+Use range partitioning on created_at.
+
+Example:
+
+```sql
+PARTITION BY RANGE (created_at);
+```
+
+Monthly partitions.
+
+Benefits:
+
+* Partition pruning reduces scanned rows
+* Smaller per-partition indexes
+* Faster vacuum
+* Easier archival
+
+---
+
+## 5.2 Pagination Strategy
+
+Never use OFFSET.
+
+Bad:
+
+```sql
+LIMIT 50 OFFSET 1000000
+```
+
+Good:
+
+```
+WHERE created_at < last_seen_timestamp
+ORDER BY created_at DESC
+LIMIT 50
+```
+
+Cursor-based pagination.
+
+---
+
+## 5.3 Memory & Page Density
+
+Wide rows reduce page density.
+
+Mitigation:
+
+* Keep projection minimal
+* Avoid storing large blobs
+* Cap JSON size
+
+---
+
+## 5.4 Write Throughput
+
+Avoid:
+
+* Triggers updating projection synchronously
+
+Use:
+
+* Async CDC
+* Kafka or logical replication
+* Batched updates
+
+---
+
+## 5.5 Projection Rebuild
+
+Must support:
+
+* Single-row rebuild
+* Partition rebuild
+* Full rebuild
+
+Rebuild should:
+
+* Be idempotent
+* Not block reads
+* Use backfill workers
+
+---
+
+# 6. Failure Mode Analysis (Expanded)
+
+This is where real systems break.
+
+---
+
+## 6.1 Eventual Consistency
+
+Projection lag means:
+
+* User sees outdated owner_name
+* Lead status appears stale
+
+Mitigation:
+
+* Monitor projection lag metric
+* Alert on > SLA threshold
+* Allow forced rebuild
+
+Define SLA clearly.
+
+---
+
+## 6.2 Lost CDC Events
+
+If event stream drops messages:
+
+Projection becomes incorrect.
+
+Mitigation:
+
+* Use durable event log
+* Implement replay mechanism
+* Periodic reconciliation job
+
+---
+
+## 6.3 Write Amplification Storm
+
+Example:
+
+* Account name change
+* 5M leads reference that account
+
+Mitigation:
+
+* Batch updates
+* Rate limit projection worker
+* Schedule off-peak
+
+---
+
+## 6.4 Index Bloat
+
+Over time:
+
+* Index size grows
+* Vacuum slows
+
+Mitigation:
+
+* Monitor index size
+* Reindex periodically
+* Remove unused indexes
+
+---
+
+## 6.5 JSONB Overgrowth
+
+If attributes grows unchecked:
+
+* Rows become huge
+* Cache efficiency drops
+
+Mitigation:
+
+* Enforce attribute schema validation
+* Size limit
+* Separate large payload tables
+
+---
+
+## 6.6 Hot Partition Contention
+
+Current month partition receives most writes.
+
+Mitigation:
+
+* Parallel projection workers
+* Partition by time + hash (if needed)
+
+---
+
+# 7. LLM + GraphQL Integration (Expanded)
+
+Now the AI layer.
+
+---
+
+## Stable GraphQL Contract
+
+```graphql
+input FilterInput {
+  field: String!
+  operator: Operator!
+  value: String!
+}
+```
+
+Never changes when fields added.
+
+---
+
+## Metadata Registry
+
+Registry stores:
+
+* field_name
+* db_column
+* data_type
+* allowed_operators
+* access_level
+* cost_weight
+
+LLM sees only:
+
+* field_name
+* type
+* operators
+
+Not:
+
+* db_column
+* index info
+* access level
+
+---
+
+## LLM Query Flow
+
+```
+User Prompt
+    ↓
+LLM → get_filterable_fields()
+    ↓
+LLM builds structured query
+    ↓
+GraphQL validates
+    ↓
+Query Builder maps field → projection column
+    ↓
+SQL executes on single table
+```
+
+---
+
+## Why Projection Makes LLM Safe
+
+Without projection:
+
+* LLM may generate deep join paths
+* JSON path filters may degrade performance
+* Query planner unpredictability
+
+With projection:
+
+* Single table
+* Controlled filter set
+* Cost model enforceable
+* Deterministic performance
+
+---
+
+# 8. Why We Avoid Full GraphQL Schema Exposure
+
+If LLM sees entire GraphQL schema:
+
+* Might traverse nested relations
+* Might expose internal-only fields
+* Might generate expensive joins
+* Schema refactor changes LLM behavior
+
+We preserve:
+
+* Clean contract boundary
+* Predictable query shapes
+* Observability
+* Cache stability
+
+---
+
+# 9. Strategic Tradeoff Summary
+
+Denormalized projection introduces:
+
+* Operational complexity
+* Eventual consistency
+* Write amplification
+
+But eliminates:
+
+* Join unpredictability
+* LLM query risk
+* Latency spikes
+* Schema churn
+* Runtime JSON extraction
+
+For a read-heavy, AI-assisted system, this tradeoff is justified.
+
+---
+
+# 10. Final Architectural Position
+
+This system:
+
+* Separates write and read models
+* Uses projection for deterministic performance
+* Uses metadata registry for extensibility
+* Uses stable GraphQL for contract control
+* Uses cost guardrails for LLM safety
+* Scales to 100M+ rows
+* Maintains operational observability
+
+It is optimized for:
+
+* Read performance
+* AI integration
+* Governance
+* Long-term maintainability
+
+---
+
+If you want, next we can:
+
+* Add query cost modeling math
+* Add multi-entity projection strategy
+* Or simulate real production load patterns and expected P99 latency curves
